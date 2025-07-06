@@ -1,0 +1,245 @@
+import pandas as pd 
+import numpy as np 
+import seaborn as sns
+import matplotlib.pyplot as plt 
+%matplotlib inline 
+
+import tensorflow as tf
+import random
+from cv2 import resize
+from glob import glob
+from sklearn.utils.class_weight import compute_class_weight
+
+img_height = 300
+img_width = 300
+train_ds = tf.keras.utils.image_dataset_from_directory(
+  "B:\\Solar panel\\Faulty_solar_panel(2)\\Faulty_solar_panel",
+  validation_split=0.3,
+  subset='training',
+  image_size=(img_height, img_width),
+  batch_size=32,
+  seed=42,
+  shuffle=True)
+
+val_ds = tf.keras.utils.image_dataset_from_directory(
+  "B:\\Solar panel\\Faulty_solar_panel(2)\\Faulty_solar_panel",
+  validation_split=0.3,
+  subset='validation',
+  image_size=(img_height, img_width),
+  batch_size=32,
+  seed=42,
+  shuffle=True)
+
+# For test dataset, we need to manually split the validation set
+# Get the validation dataset as a numpy array
+val_images = []
+val_labels = []
+
+for images, labels in val_ds:
+    val_images.append(images.numpy())
+    val_labels.append(labels.numpy())
+
+val_images = np.concatenate(val_images, axis=0)
+val_labels = np.concatenate(val_labels, axis=0)
+
+# Split validation into validation and test (50% each to get 15% of original data for each)
+val_size = len(val_images)
+split_idx = val_size // 2
+
+# Create new validation and test datasets
+val_images_final = val_images[:split_idx]
+val_labels_final = val_labels[:split_idx]
+test_images = val_images[split_idx:]
+test_labels = val_labels[split_idx:]
+
+# Convert back to TensorFlow datasets
+val_ds_final = tf.data.Dataset.from_tensor_slices((val_images_final, val_labels_final)).batch(32)
+test_ds = tf.data.Dataset.from_tensor_slices((test_images, test_labels)).batch(32)
+
+# Print and get the classes' names
+class_names = train_ds.class_names
+print(class_names)
+
+# plot the image in the training dataset
+plt.figure(figsize=(15, 15))
+for images, labels in train_ds.take(1):
+    for i in range(25):
+        ax = plt.subplot(5, 5, i + 1)
+        plt.imshow(images[i].numpy().astype("uint8"))
+        plt.title(class_names[labels[i]])
+        plt.axis("off")
+
+# get the efficientnet-B3
+base_model = tf.keras.applications.EfficientNetB3(
+    include_top=False,
+    weights='imagenet',
+    input_shape=(img_height, img_width, 3)
+)
+base_model.trainable = False 
+
+base_model.summary()
+
+#rebuild the classification layer
+inputs = tf.keras.Input(shape=(img_height, img_width, 3))
+x = tf.keras.applications.efficientnet.preprocess_input(inputs)
+x = base_model(x, training=False)
+x = tf.keras.layers.BatchNormalization()(x)
+x = tf.keras.layers.GlobalAveragePooling2D()(x)
+x = tf.keras.layers.Dropout(0.3)(x)
+outputs = tf.keras.layers.Dense(6, activation='softmax')(x)
+model = tf.keras.Model(inputs, outputs)
+
+model.summary()
+
+# show the model structure
+from keras.utils import plot_model
+plot_model(model, to_file='EFFB3_plot.png', show_shapes=True, show_layer_names=True)
+train_ds
+
+
+model.compile(optimizer=tf.keras.optimizers.Adam(0.001),
+              loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
+              metrics=['accuracy']   
+
+import datetime
+# Set up TensorBoard callback with histogram visualization
+log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+tensorboard_callback = tf.keras.callbacks.TensorBoard(
+    log_dir=log_dir,
+    histogram_freq=1,  # Enable histogram computation for weight analysis
+    write_graph=True,
+    write_images=True,
+    update_freq='epoch',
+    profile_batch=0
+)
+
+early_stopping_callback = tf.keras.callbacks.EarlyStopping(
+    monitor="val_loss",
+    min_delta=1e-2,
+    patience=5,
+    verbose=1,
+    restore_best_weights=True
+)
+
+epoch = 30
+history_1 = model.fit(train_ds, validation_data=val_ds_final, epochs=epoch, 
+    callbacks = [tensorboard_callback, early_stopping_callback]
+)
+
+# plot the graph
+get_ac = history_1.history['accuracy']
+get_los = history_1.history['loss']
+val_acc = history_1.history['val_accuracy']
+val_loss = history_1.history['val_loss']
+
+epochs = range(len(get_ac))
+plt.plot(epochs, get_ac, 'g', label='Accuracy of Training data')
+plt.plot(epochs, get_los, 'r', label='Loss of Training data')
+plt.title('Training data accuracy and loss')
+plt.legend(loc=0)
+plt.figure()
+
+plt.plot(epochs, get_ac, 'g', label='Accuracy of Training Data')
+plt.plot(epochs, val_acc, 'r', label='Accuracy of Validation Data')
+plt.title('Training and Validation Accuracy')
+plt.legend(loc=0)
+plt.figure()
+
+plt.plot(epochs, get_los, 'g', label='Loss of Training Data')
+plt.plot(epochs, val_loss, 'r', label='Loss of Validation Data')
+plt.title('Training and Validation Loss')
+plt.legend(loc=0)
+plt.figure()
+plt.show()
+             )
+
+# evaluate the image in val_dataset 
+loss, accuracy = model.evaluate(val_ds_final)
+
+plt.figure(figsize=(20, 20))
+for images, labels in val_ds_final.take(1):
+    for i in range(25):
+        ax = plt.subplot(5, 5, i + 1)
+        plt.imshow(images[i].numpy().astype("uint8"))
+        predictions = model.predict(tf.expand_dims(images[i], 0))
+        score = tf.nn.softmax(predictions[0])
+        if(class_names[labels[i]]==class_names[np.argmax(score)]):
+            plt.title("Actual: "+class_names[labels[i]])
+            plt.ylabel("Predicted: "+class_names[np.argmax(score)],fontdict={'color':'green'})
+            
+        else:
+            plt.title("Actual: "+class_names[labels[i]])
+            plt.ylabel("Predicted: "+class_names[np.argmax(score)],fontdict={'color':'red'})
+        plt.gca().axes.yaxis.set_ticklabels([])        
+        plt.gca().axes.xaxis.set_ticklabels([])
+
+
+# # evaluate the untested image in test_dataset 
+loss2, accuracy2 = model.evaluate(test_ds)
+
+plt.figure(figsize=(20, 20))
+for images, labels in test_ds.take(1):
+    for i in range(25):
+        ax = plt.subplot(5, 5, i + 1)
+        plt.imshow(images[i].numpy().astype("uint8"))
+        predictions = model.predict(tf.expand_dims(images[i], 0))
+        score = tf.nn.softmax(predictions[0])
+        if(class_names[labels[i]]==class_names[np.argmax(score)]):
+            plt.title("Actual: "+class_names[labels[i]])
+            plt.ylabel("Predicted: "+class_names[np.argmax(score)],fontdict={'color':'green'})
+            
+        else:
+            plt.title("Actual: "+class_names[labels[i]])
+            plt.ylabel("Predicted: "+class_names[np.argmax(score)],fontdict={'color':'red'})
+        plt.gca().axes.yaxis.set_ticklabels([])        
+        plt.gca().axes.xaxis.set_ticklabels([])
+
+# get the confusion matrix and accuracy of val_image
+X_val,y_val,y_pred=[],[],[]
+for images, labels in val_ds_final:
+    y_val.extend(labels.numpy())
+    X_val.extend(images.numpy())
+predictions=model.predict(np.array(X_val))
+for i in predictions:
+    y_pred.append(np.argmax(i))
+df=pd.DataFrame()
+df['Actual'],df['Prediction']=y_val,y_pred
+df
+
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, accuracy_score
+ax= plt.subplot()
+CM = confusion_matrix(y_val,y_pred)
+sns.heatmap(CM, annot=True, fmt='g', ax=ax,cbar=False,cmap='Blues')
+ax.set_xlabel('Predicted labels')
+ax.set_ylabel('True labels') 
+ax.set_title('Confusion Matrix')
+plt.show()
+CM
+
+Acc = accuracy_score(y_val,y_pred)
+print("accuracy is: {0:.2f}%".format(Acc * 100))
+
+# get the confusion matrix and accuracy of untested_image
+X_test,y_test,y_preds=[],[],[]
+for images, labels in test_ds:
+    y_test.extend(labels.numpy())
+    X_test.extend(images.numpy())
+predictions=model.predict(np.array(X_test))
+for i in predictions:
+    y_preds.append(np.argmax(i))
+df=pd.DataFrame()
+df['Actual'],df['Prediction']=y_test,y_preds
+df
+
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve, accuracy_score
+ax= plt.subplot()
+CM = confusion_matrix(y_test,y_preds)
+sns.heatmap(CM, annot=True, fmt='g', ax=ax,cbar=False,cmap='Blues')
+ax.set_xlabel('Predicted labels - test')
+ax.set_ylabel('True labels - test') 
+ax.set_title('Confusion Matrix - test')
+plt.show()
+CM
+
+Acc = accuracy_score(y_test,y_preds)
+print("accuracy is: {0:.2f}%".format(Acc * 100))
