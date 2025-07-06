@@ -1,0 +1,338 @@
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import cv2
+import os
+#from tensorflow.keras.models import Model
+#from tensorflow.keras.layers import GlobalAveragePooling2D, Dense
+#from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.utils.class_weight import compute_class_weight
+
+# Set random seed for reproducibility
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# Dataset parameters
+dataset_path = "B:\\Solar panel\\Faulty_solar_panel(2)\\Faulty_solar_panel"  # Update with your path
+img_size = (300, 300)  # EfficientNet-B3 default size
+batch_size = 32
+num_classes = 6
+
+# Data generators with augmentation
+train_datagen = tf.keras.preprocessing.image.ImageDataGenerator(
+    preprocessing_function=tf.keras.applications.efficientnet.preprocess_input,
+    validation_split=0.2,
+    rotation_range=20,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True
+)
+
+# Create data generators
+train_generator = train_datagen.flow_from_directory(
+    dataset_path,
+    target_size=img_size,
+    batch_size=batch_size,
+    class_mode='categorical',  # Multi classification: 
+    subset='training',
+    shuffle=True
+)
+
+val_generator = train_datagen.flow_from_directory(
+    dataset_path,
+    target_size=img_size,
+    batch_size=batch_size,
+    class_mode='categorical',
+    subset='validation',
+    shuffle=False
+)
+
+# Get class names and indices
+class_indices = train_generator.class_indices
+class_names = list(class_indices.keys())
+print("Class names:", class_names)
+
+# Compute class weights
+class_weights = compute_class_weight(
+    'balanced',
+    classes=np.unique(train_generator.classes),
+    y=train_generator.classes
+)
+class_weights = dict(enumerate(class_weights))
+print("Class weights:", class_weights)
+
+# Build EfficientNet-B3 model
+base_model = tf.keras.applications.EfficientNetB3(
+    weights='imagenet',
+    include_top=False,
+    input_shape=(img_size[0], img_size[1], 3)
+)
+
+# Freeze base model layers
+base_model.trainable = False
+
+#inputs = tf.keras.Input(shape=(img_size[0], img_size[1], 3))
+#x = tf.keras.applications.efficientnet.preprocess_input(inputs)
+x = base_model.output
+#x = tf.keras.layers.BatchNormalization()(x)
+x = tf.keras.layers.GlobalAveragePooling2D(name="avg_pool")(x)
+x = tf.keras.layers.Dropout(0.3, name="top_dropout")(x)
+predictions = tf.keras.layers.Dense(num_classes, activation='softmax', name="predictions")(x)
+model = tf.keras.Model(inputs=base_model.input, outputs=predictions, name="EfficientNet-B3")
+
+model.summary()
+
+from keras.utils import plot_model
+plot_model(model, to_file='EFFB3-GC_plot.png', show_shapes=True, show_layer_names=True)
+
+# # Compile with class weights
+model.compile(optimizer=tf.keras.optimizers.Adam(0.001),
+              loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
+              metrics=['accuracy',
+                      tf.keras.metrics.Precision(name='precision'), 
+                      tf.keras.metrics.Recall(name='recall')
+                      ]
+)
+
+# Train initial model
+import datetime
+# Set up TensorBoard callback with histogram visualization
+log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+tensorboard_callback = tf.keras.callbacks.TensorBoard(
+    log_dir=log_dir,
+    histogram_freq=1,  # Enable histogram computation for weight analysis
+    write_graph=True,
+    write_images=True,
+    update_freq='epoch',
+    profile_batch=0
+)
+
+early_stopping_callback = tf.keras.callbacks.EarlyStopping(
+    monitor="val_loss",
+    min_delta=1e-2,
+    patience=5,
+    verbose=1,
+    restore_best_weights=True
+)
+
+
+
+epoch = 50
+history = model.fit(
+    train_generator, 
+    validation_data=val_generator, 
+    epochs=epoch, 
+    #class_weight=class_weights, 
+    callbacks = [tensorboard_callback, early_stopping_callback],
+    verbose=1
+)
+
+model.save('solar_panel_6class_classifier.keras')
+
+# Find the last convolutional layer automatically
+def find_target_layer(model):
+    for layer in reversed(model.layers):
+        # Check if layer is a Conv layer by checking its class name
+        # or by checking the shape of its output tensor
+        if 'conv' in layer.__class__.__name__.lower():
+            return layer.name
+        # Alternative approach using get_output_at method
+        try:
+            # For TF 2.x compatibility
+            output_shape = layer.output.shape
+            if len(output_shape) == 4:  # 4D output (conv layer)
+                return layer.name
+        except (AttributeError, IndexError):
+            continue
+    raise ValueError("Could not find 4D layer for Grad-CAM")
+
+# Use this in your code after model creation
+target_layer_name = find_target_layer(model)
+print(f"Using layer for Grad-CAM: {target_layer_name}")
+
+# GRAD-CAM Implementation
+def generate_grad_cam(model, img_array, layer_name='top_activation', class_idx=None):
+    grad_model = Model(
+        inputs=model.inputs,
+        outputs=[model.get_layer(layer_name).output, model.output]
+    )
+    
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        # Modified for multi-class: if class_idx not specified, use the predicted class
+        if class_idx is None:
+            class_idx = tf.argmax(predictions[0])  # Get the index of highest probability
+        else:
+            class_idx = tf.constant(class_idx)
+        loss = predictions[:, class_idx]
+    
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0)  # ReLU
+    heatmap /= tf.reduce_max(heatmap)  # Normalize
+    
+    return heatmap.numpy(), class_idx.numpy
+
+def overlay_heatmap(original_img, heatmap, alpha=0.4):
+    heatmap = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    overlayed = cv2.addWeighted(original_img, alpha, heatmap, 1 - alpha, 0)
+    return overlayed
+
+# Analyze samples from all classes with Grad-CAM
+def analyze_class_samples(model, generator, layer_name, num_samples=3):
+    n_classes = len(generator.class_indices)
+    plt.figure(figsize=(15, 4 * n_classes))
+    
+    for class_idx in range(n_classes):
+        # Get class samples
+        class_indices = np.where(generator.classes == class_idx)[0]
+        if len(class_indices) == 0:
+            continue
+            
+        selected_indices = np.random.choice(class_indices, num_samples, replace=False)
+        
+        for i, idx in enumerate(selected_indices):
+            # Get image path
+            filepath = generator.filepaths[idx]
+            original_img = cv2.imread(filepath)
+            original_img = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+            
+            # Preprocess for model
+            img = tf.keras.preprocessing.image.load_img(filepath, target_size=img_size)
+            img_array = tf.keras.preprocessing.image.img_to_array(img)
+            img_array = np.expand_dims(img_array, axis=0)
+            img_array = tf.keras.applications.efficientnet.preprocess_input(img_array)
+            
+            # Generate Grad-CAM
+            heatmap, pred_class = generate_grad_cam(model, img_array, layer_name=layer_name, class_idx=class_idx)
+
+            # Convert tensor to integer if needed
+            if hasattr(pred_class, 'numpy'):
+                pred_class = pred_class.numpy()
+            
+            # Overlay heatmap
+            overlayed_img = overlay_heatmap(original_img, heatmap)
+            
+            # Get true and predicted class names
+            true_class_name = class_names[class_idx]
+            
+            # SAFE ACCESS: Handle both integers and numpy types
+            try:
+                pred_class_name = class_names[int(pred_class)]
+            except (IndexError, TypeError, ValueError):
+                pred_class_name = f"Class {pred_class}"
+            
+            # Plot original
+            plt.subplot(n_classes, num_samples * 2, class_idx * (num_samples * 2) + 2*i + 1)
+            plt.imshow(original_img)
+            plt.title(f"True: {true_class_name}")
+            plt.axis('off')
+            
+            # Plot heatmap
+            plt.subplot(n_classes, num_samples * 2, class_idx * (num_samples * 2) + 2*i + 2)
+            plt.imshow(overlayed_img)
+            plt.title(f"Pred: {pred_class_name}\nAttention: {true_class_name}")
+            plt.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+
+from keras.models import Model
+# Run analysis on all classes
+print("Analyzing samples from all classes...")
+analyze_class_samples(model, val_generator, layer_name=target_layer_name, num_samples=3)
+
+# Identify augmentation candidates for minority classes
+def identify_augmentation_candidates(model, generator, class_idx, threshold=0.3):
+    candidate_paths = []
+    class_indices = np.where(generator.classes == class_idx)[0]
+    
+    for idx in class_indices:
+        filepath = generator.filepaths[idx]
+        
+        # Preprocess image
+        img = tf.keras.preprocessing.image.load_img(filepath, target_size=img_size)
+        img_array = tf.keras.preprocessing.image.img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0)
+        img_array = tf.keras.applications.efficientnet.preprocess_input(img_array)
+        
+        # Generate Grad-CAM
+        heatmap, _ = generate_grad_cam(model, img_array, class_idx=class_idx)
+        
+        # Check if heatmap is too diffuse (model uncertain)
+        if np.mean(heatmap) < threshold:
+            candidate_paths.append(filepath)
+            print(f"Class {class_names[class_idx]} candidate: {filepath} (Mean heatmap: {np.mean(heatmap):.3f})")
+    
+    return candidate_paths
+
+# Find augmentation candidates for all minority classes
+augmentation_candidates = {}
+for class_idx in range(num_classes):
+    if class_weights[class_idx] > 1.0:  # Only minority classes
+        print(f"\nFinding candidates for {class_names[class_idx]}:")
+        candidates = identify_augmentation_candidates(model, train_generator, class_idx)
+        augmentation_candidates[class_idx] = candidates
+
+# Implement targeted augmentation
+def create_targeted_augmentation(img_path, heatmap, class_idx):
+    img = tf.keras.preprocessing.image.load_img(img_path)
+    img_array = tf.keras.preprocessing.image.img_to_array(img)
+    
+    # Create mask based on heatmap
+    heatmap_resized = cv2.resize(heatmap, (img_array.shape[1], img_array.shape[0]))
+    mask = heatmap_resized < 0.2  # Only augment non-important regions
+    
+    # Class-specific augmentations
+    if "crack" in class_names[class_idx].lower():
+        # Add crack-like patterns to non-important areas
+        noise = np.random.normal(0, 25, img_array.shape).astype(np.uint8)
+        img_array[mask] = np.clip(img_array[mask] + noise[mask], 0, 255)
+    elif "dirt" in class_names[class_idx].lower():
+        # Add dirt-like spots
+        for _ in range(10):
+            y, x = np.random.randint(0, img_array.shape[0]), np.random.randint(0, img_array.shape[1])
+            if mask[y, x]:
+                cv2.circle(img_array, (x, y), 5, (40, 40, 40), -1)
+    else:
+        # Generic augmentation: color jitter
+        jitter = np.random.randint(-30, 30, 3)
+        img_array[mask] = np.clip(img_array[mask] + jitter, 0, 255)
+    
+    return img_array
+
+# Apply targeted augmentation to candidates
+for class_idx, candidates in augmentation_candidates.items():
+    print(f"\nAugmenting samples for {class_names[class_idx]}:")
+    for candidate in candidates[:6]:  # Process first 3 candidates
+        img = tf.keras.preprocessing.image.load_img(candidate, target_size=img_size)
+        img_array = tf.keras.preprocessing.image.img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0)
+        img_array = tf.keras.applications.efficientnet.preprocess_input(img_array)
+        
+        heatmap, _ = generate_grad_cam(model, img_array, class_idx=class_idx)
+        augmented_img = create_targeted_augmentation(candidate, heatmap, class_idx)
+        
+        plt.figure(figsize=(10, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(cv2.cvtColor(cv2.imread(candidate), cv2.COLOR_BGR2RGB))
+        plt.title(f"Original: {class_names[class_idx]}")
+        plt.axis('off')
+        
+        plt.subplot(1, 2, 2)
+        plt.imshow(augmented_img.astype(np.uint8))
+        plt.title("Augmented")
+        plt.axis('off')
+        plt.show()
+
+
+
